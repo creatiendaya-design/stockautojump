@@ -7,9 +7,6 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "netlify dev"
   },
-    "dependencies": {
-    "node-fetch": "^3.3.2"
-  },
   "keywords": [],
   "author": "",
   "license": "ISC",

@@ -1,78 +1,91 @@
-import fetch from 'node-fetch';
+// ⚠️ No importes node-fetch. Node 18 en Netlify ya tiene fetch global.
 
-export async function handler(event, context) {
-  const STORE = process.env.SHOPIFY_STORE;
-  const TOKEN = process.env.SHOPIFY_API_KEY;
-  const VERSION = process.env.SHOPIFY_API_VERSION;
+exports.handler = async (event, context) => {
+  try {
+    const STORE   = process.env.SHOPIFY_STORE;       // ej: https://tutienda.myshopify.com
+    const TOKEN   = process.env.SHOPIFY_API_KEY;     // shpat_...
+    const VERSION = process.env.SHOPIFY_API_VERSION || '2024-07';
 
-  const today = new Date().toISOString().split('T')[0];
-  const actualizados = [];
+    // Validación para evitar "Invalid URL"
+    const missing = [];
+    if (!STORE)   missing.push('SHOPIFY_STORE');
+    if (!TOKEN)   missing.push('SHOPIFY_API_KEY');
+    if (!VERSION) missing.push('SHOPIFY_API_VERSION');
 
-  // Paso 1: Obtener productos (paginado con límite 50 por simplicidad)
-  const res = await fetch(`${STORE}/admin/api/${VERSION}/products.json?limit=50`, {
-    headers: {
-      'X-Shopify-Access-Token': TOKEN,
-      'Content-Type': 'application/json'
+    try { new URL(STORE); } catch { missing.push('SHOPIFY_STORE (URL inválida; incluye https://)'); }
+    if (missing.length) {
+      return { statusCode: 500, body: JSON.stringify({ error: 'Faltan variables', missing }) };
     }
-  });
 
-  const { products } = await res.json();
+    const today = new Date().toISOString().split('T')[0];
+    const actualizados = [];
 
-  for (const product of products) {
-    const productId = product.id;
-
-    // Paso 2: Obtener los 2 metafields personalizados del producto
-    const metaRes = await fetch(`${STORE}/admin/api/${VERSION}/products/${productId}/metafields.json`, {
+    // 1) Listar productos (nota: limita a 50; para más, implementa paginación con page_info)
+    const res = await fetch(`${STORE}/admin/api/${VERSION}/products.json?limit=50`, {
       headers: {
         'X-Shopify-Access-Token': TOKEN,
         'Content-Type': 'application/json'
       }
     });
+    if (!res.ok) {
+      const text = await res.text();
+      return { statusCode: res.status, body: JSON.stringify({ step: 'fetch_products', text }) };
+    }
+    const { products = [] } = await res.json();
 
-    const { metafields } = await metaRes.json();
+    for (const product of products) {
+      const productId = product.id;
 
-    const fechaMeta = metafields.find(m => m.namespace === 'custom' && m.key === 'fecha_disponibilidad');
-    const stockMeta = metafields.find(m => m.namespace === 'custom' && m.key === 'stock_programado');
-
-    if (!fechaMeta || !stockMeta) continue;
-
-    const fechaDisponible = fechaMeta.value; // formato ISO
-    const cantidadStock = parseInt(stockMeta.value || '0', 10);
-
-    // Si la fecha es hoy y hay cantidad, actualizamos
-    if (fechaDisponible === today && cantidadStock > 0) {
-      const variantId = product.variants[0].id;
-
-      // Actualizar inventario
-      const updateRes = await fetch(`${STORE}/admin/api/${VERSION}/variants/${variantId}.json`, {
-        method: 'PUT',
+      // 2) Leer metafields del producto
+      const metaRes = await fetch(`${STORE}/admin/api/${VERSION}/products/${productId}/metafields.json`, {
         headers: {
           'X-Shopify-Access-Token': TOKEN,
           'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          variant: {
-            id: variantId,
-            inventory_quantity: cantidadStock,
-            inventory_management: 'shopify'
-          }
-        })
+        }
       });
+      if (!metaRes.ok) continue;
+      const { metafields = [] } = await metaRes.json();
 
-      actualizados.push({
-        productId,
-        variantId,
-        fechaDisponible,
-        cantidadStock
-      });
+      const fechaMeta = metafields.find(m => m.namespace === 'custom' && m.key === 'fecha_disponibilidad');
+      const stockMeta = metafields.find(m => m.namespace === 'custom' && m.key === 'stock_programado');
+      if (!fechaMeta || !stockMeta) continue;
+
+      const fechaDisponible = String(fechaMeta.value).slice(0, 10);
+      const cantidadStock   = parseInt(stockMeta.value || '0', 10);
+
+      if (fechaDisponible === today && cantidadStock > 0) {
+        const variantId = product?.variants?.[0]?.id;
+        if (!variantId) continue;
+
+        // 3) Actualizar inventario de la primera variante
+        const upd = await fetch(`${STORE}/admin/api/${VERSION}/variants/${variantId}.json`, {
+          method: 'PUT',
+          headers: {
+            'X-Shopify-Access-Token': TOKEN,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            variant: {
+              id: variantId,
+              inventory_quantity: cantidadStock,
+              inventory_management: 'shopify'
+            }
+          })
+        });
+
+        if (upd.ok) {
+          actualizados.push({ productId, variantId, cantidadStock, fechaDisponible });
+        } else {
+          actualizados.push({ productId, variantId, error: await upd.text() });
+        }
+      }
     }
-  }
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({
-      message: 'Proceso completado ok',
-      actualizados
-    })
-  };
-}
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ message: 'Proceso completado ok', date: today, actualizados }, null, 2)
+    };
+  } catch (err) {
+    return { statusCode: 500, body: JSON.stringify({ error: err?.message || String(err) }) };
+  }
+};
