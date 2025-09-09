@@ -1,0 +1,6 @@
+[functions]
+  directory = "functions"
+
+[[functions]]
+  name = "actualizar-stock"
+  schedule = "@daily"
