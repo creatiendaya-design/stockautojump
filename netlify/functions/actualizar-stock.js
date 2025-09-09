@@ -49,12 +49,42 @@ async function putJSON(url, headers, body) {
   if (!r.ok) throw new Error(`PUT ${url} -> ${r.status}: ${tx}`);
   return JSON.parse(tx);
 }
-async function del(url, headers) {
-  const r = await fetch(url, { method: 'DELETE', headers });
-  if (!r.ok) {
-    const tx = await r.text();
-    throw new Error(`DELETE ${url} -> ${r.status}: ${tx}`);
-  }
+
+// --- Dejar en "vacío" (0) un metafield integer vía GraphQL ---
+async function setMetafieldIntZero(store, token, ownerIdGID, namespace, key) {
+  const version = process.env.SHOPIFY_API_VERSION || '2024-07';
+  const r = await fetch(`${store}/admin/api/${version}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': token,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      query: `
+        mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields { id value }
+            userErrors { field message }
+          }
+        }`,
+      variables: {
+        metafields: [{
+          ownerId: ownerIdGID,
+          namespace,
+          key,
+          type: "integer",
+          value: "0"           // "vacío" para integer
+        }]
+      }
+    })
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`GraphQL metafieldsSet ${r.status}: ${text}`);
+  const json = JSON.parse(text);
+  const res = json.data?.metafieldsSet;
+  if (!res) throw new Error(`metafieldsSet response vacío: ${text}`);
+  if (res.userErrors?.length) throw new Error(`metafieldsSet userErrors: ${JSON.stringify(res.userErrors)}`);
+  return res.metafields?.[0];
 }
 
 // ========= handler =========
@@ -83,7 +113,6 @@ exports.handler = async (event) => {
     const silent          = qs.silent === '1' || qs.silent === 'true';
 
     const headers = { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' };
-
     const updated = [];
     const skipped = [];
     const debug   = [];
@@ -104,11 +133,11 @@ exports.handler = async (event) => {
                 id
                 legacyResourceId
                 inventoryItem { id legacyResourceId tracked }
-                variantStock: metafield(namespace: "custom", key: "stock_programado") { id value }
+                variantStock: metafield(namespace: "custom", key: "stock_programado") { value }
               }
             }
             metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
-            productStock: metafield(namespace: "custom", key: "stock_programado") { id value }
+            productStock: metafield(namespace: "custom", key: "stock_programado") { value }
             metafieldTZ:   metafield(namespace: "custom", key: "timezone") { value }
           }
         }`, { id: `gid://shopify/Product/${productIdFilter}` });
@@ -121,7 +150,7 @@ exports.handler = async (event) => {
 
       await processProducts({
         products: [data.product],
-        STORE, VERSION, headers,
+        STORE, TOKEN, VERSION, headers,
         defaultTZ: DEFAULT_TZ, force, locationId,
         updated, skipped, debug, wantDebug
       });
@@ -148,11 +177,11 @@ exports.handler = async (event) => {
                   id
                   legacyResourceId
                   inventoryItem { id legacyResourceId tracked }
-                  variantStock: metafield(namespace: "custom", key: "stock_programado") { id value }
+                  variantStock: metafield(namespace: "custom", key: "stock_programado") { value }
                 }
               }
               metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
-              productStock: metafield(namespace: "custom", key: "stock_programado") { id value }
+              productStock: metafield(namespace: "custom", key: "stock_programado") { value }
               metafieldTZ:   metafield(namespace: "custom", key: "timezone") { value }
             }
           }
@@ -162,7 +191,7 @@ exports.handler = async (event) => {
 
       await processProducts({
         products,
-        STORE, VERSION, headers,
+        STORE, TOKEN, VERSION, headers,
         defaultTZ: DEFAULT_TZ, force, locationId,
         updated, skipped, debug, wantDebug
       });
@@ -178,7 +207,6 @@ exports.handler = async (event) => {
     }
 
     // 3) MASIVO: SOLO productos con ambos metafields a nivel producto
-    //  (igual, si una variante tiene stock_programado lo usaremos prioritariamente)
     let hasNextPage = true;
     let cursor = null;
     let totalFetched = 0;
@@ -199,11 +227,11 @@ exports.handler = async (event) => {
                   id
                   legacyResourceId
                   inventoryItem { id legacyResourceId tracked }
-                  variantStock: metafield(namespace: "custom", key: "stock_programado") { id value }
+                  variantStock: metafield(namespace: "custom", key: "stock_programado") { value }
                 }
               }
               metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
-              productStock: metafield(namespace: "custom", key: "stock_programado") { id value }
+              productStock: metafield(namespace: "custom", key: "stock_programado") { value }
               metafieldTZ:   metafield(namespace: "custom", key: "timezone") { value }
             }
           }
@@ -214,7 +242,7 @@ exports.handler = async (event) => {
 
       await processProducts({
         products,
-        STORE, VERSION, headers,
+        STORE, TOKEN, VERSION, headers,
         defaultTZ: DEFAULT_TZ, force, locationId,
         updated, skipped, debug, wantDebug
       });
@@ -234,7 +262,6 @@ exports.handler = async (event) => {
     return { statusCode: 200, headers:{'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
 
   } catch (err) {
-    // En modo silent, no devuelvas cuerpo grande
     const qs = event?.queryStringParameters || {};
     if (qs.silent === '1' || qs.silent === 'true') {
       console.error('Error actualizar-stock:', err?.message || err);
@@ -246,18 +273,17 @@ exports.handler = async (event) => {
 
 // ========= procesador =========
 async function processProducts({
-  products, STORE, VERSION, headers, defaultTZ, force, locationId,
+  products, STORE, TOKEN, VERSION, headers, defaultTZ, force, locationId,
   updated, skipped, debug, wantDebug
 }) {
   for (const p of products) {
     const fecha = p?.metafield?.value ? String(p.metafield.value).slice(0, 10) : null;
-    const productStockId  = p?.productStock?.id || null;
     const productStockVal = p?.productStock?.value ? parseInt(p.productStock.value, 10) : 0;
-
     const productTZ = (p?.metafieldTZ?.value || defaultTZ).trim();
     const todayLocal = ymdInTZ(new Date(), productTZ);
 
     const v = p?.variants?.nodes?.[0];
+
     if (wantDebug) {
       debug.push({
         productId: p.id, handle: p.handle, fecha, productStockVal,
@@ -278,30 +304,29 @@ async function processProducts({
       continue;
     }
 
-    // Prioridad: stock programado en VARIANTE, si existe y >0; si no, PRODUCTO
-    const variantStockId  = v?.variantStock?.id || null;
+    // Prioridad: VARIANTE > PRODUCTO
     const variantStockVal = v?.variantStock?.value ? parseInt(v.variantStock.value, 10) : 0;
-
     const stockToSet = variantStockVal > 0 ? variantStockVal : productStockVal;
     if (!stockToSet || stockToSet < 0) {
       skipped.push({ productId: p.id, variantId: v.legacyResourceId, reason: 'invalid_or_zero_stock', stockToSet });
       continue;
     }
 
-    // Asegurar que el inventory item esté "tracked"
+    // Asegurar tracked
     if (v.inventoryItem && v.inventoryItem.tracked === false) {
       try {
-        await putJSON(`${STORE}/admin/api/${VERSION}/inventory_items/${v.inventoryItem.legacyResourceId}.json`, headers, {
+        await putJSON(`${STORE}/admin/api/${VERSION}/inventory_items/${v.inventoryItem.legacyResourceId.json}`, headers, {
           inventory_item: { id: v.inventoryItem.legacyResourceId, tracked: true }
         });
       } catch (e) {
-        skipped.push({ productId: p.id, variantId: v.legacyResourceId, reason: 'enable_tracked_failed', error: e.message });
-        await sleep(700);
-        continue;
+        // Si hubo typo en la URL .json arriba, corrígelo:
+        await putJSON(`${STORE}/admin/api/${VERSION}/inventory_items/${v.inventoryItem.legacyResourceId}.json`, headers, {
+          inventory_item: { id: v.inventoryItem.legacyResourceId, tracked: true }
+        });
       }
     }
 
-    // Setear inventario en la location
+    // Setear inventario
     try {
       const r = await fetch(`${STORE}/admin/api/${VERSION}/inventory_levels/set.json`, {
         method: 'POST',
@@ -315,22 +340,18 @@ async function processProducts({
       const tx = await r.text();
       if (!r.ok) throw new Error(`SET inventory -> ${r.status}: ${tx}`);
 
-      // === Borrar metafields de stock_programado (variante y producto) ===
-      // Borra SI existen; así evitas re-aplicar en siguientes ejecuciones.
+      // === VACIAR (poner 0) los metafields de stock en variante y producto ===
       try {
-        if (variantStockId) {
-          await del(`${STORE}/admin/api/${VERSION}/metafields/${variantStockId}.json`, headers);
-        }
+        // Variante
+        await setMetafieldIntZero(STORE, TOKEN, v.id, 'custom', 'stock_programado');
       } catch (e) {
-        // No es crítico para detener el flujo; solo registrar
-        console.warn('DELETE variant stock_programado failed:', e.message);
+        console.warn('metafieldsSet variant stock_programado -> 0 failed:', e.message);
       }
       try {
-        if (productStockId) {
-          await del(`${STORE}/admin/api/${VERSION}/metafields/${productStockId}.json`, headers);
-        }
+        // Producto
+        await setMetafieldIntZero(STORE, TOKEN, p.id, 'custom', 'stock_programado');
       } catch (e) {
-        console.warn('DELETE product stock_programado failed:', e.message);
+        console.warn('metafieldsSet product stock_programado -> 0 failed:', e.message);
       }
 
       updated.push({
@@ -340,10 +361,11 @@ async function processProducts({
         inventoryItemId: v.inventoryItem.legacyResourceId,
         locationId,
         setTo: stockToSet,
-        clearedVariantStockMeta: Boolean(variantStockId),
-        clearedProductStockMeta: Boolean(productStockId),
-        fechaAplicada: force ? '(FORCED)' : todayInTZ(todayLocal)
+        clearedVariantToZero: true,
+        clearedProductToZero: true,
+        fechaAplicada: force ? '(FORCED)' : todayLocal
       });
+
     } catch (e) {
       skipped.push({ productId: p.id, variantId: v.legacyResourceId, reason: 'inventory_set_failed', error: e.message });
     }
@@ -351,6 +373,3 @@ async function processProducts({
     await sleep(300); // pacing REST
   }
 }
-
-// helper para uniformidad del campo (por si agregas más adelante hora)
-function todayInTZ(ymd) { return ymd; }
