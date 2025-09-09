@@ -1,12 +1,31 @@
 // Node 18 en Netlify ya tiene fetch global.
 
+// === utilidades ===
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function ymdInTZ(date, tz) {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
   }).format(date); // YYYY-MM-DD
 }
-
+function summarize(obj, max = 5) {
+  const out = { ...obj };
+  if (Array.isArray(out.updated) && out.updated.length > max) {
+    out.updated_sample = out.updated.slice(0, max);
+    out.updated_total = out.updated.length;
+    delete out.updated;
+  }
+  if (Array.isArray(out.skipped) && out.skipped.length > max) {
+    out.skipped_sample = out.skipped.slice(0, max);
+    out.skipped_total = out.skipped.length;
+    delete out.skipped;
+  }
+  if (Array.isArray(out.debug) && out.debug.length > max) {
+    out.debug_sample = out.debug.slice(0, max);
+    out.debug_total = out.debug.length;
+    delete out.debug;
+  }
+  return out;
+}
 async function gql(store, token, query, variables = {}) {
   const version = process.env.SHOPIFY_API_VERSION || '2024-07';
   const r = await fetch(`${store}/admin/api/${version}/graphql.json`, {
@@ -23,7 +42,6 @@ async function gql(store, token, query, variables = {}) {
   if (json.errors) throw new Error(`Errores de GraphQL: ${JSON.stringify(json.errors)}`);
   return json.data;
 }
-
 async function getAnyLocationIdREST(store, headers) {
   const version = process.env.SHOPIFY_API_VERSION || '2024-07';
   const r = await fetch(`${store}/admin/api/${version}/locations.json`, { headers });
@@ -33,7 +51,6 @@ async function getAnyLocationIdREST(store, headers) {
   if (!locations.length) throw new Error('No hay locations en la tienda');
   return locations[0].id;
 }
-
 async function putJSON(url, headers, body) {
   const r = await fetch(url, { method: 'PUT', headers, body: JSON.stringify(body) });
   const text = await r.text();
@@ -41,6 +58,7 @@ async function putJSON(url, headers, body) {
   return JSON.parse(text);
 }
 
+// === handler principal ===
 exports.handler = async (event) => {
   try {
     const STORE   = process.env.SHOPIFY_STORE;        // https://tu-tienda.myshopify.com
@@ -57,11 +75,13 @@ exports.handler = async (event) => {
       return { statusCode: 500, body: JSON.stringify({ error: 'Faltan variables', missing }) };
     }
 
+    // Query params
     const qs = event.queryStringParameters || {};
     const productIdFilter = qs.productId ? Number(qs.productId) : null;
     const handleFilter    = qs.handle || null;
     const force           = qs.force === '1' || qs.force === 'true';
     const wantDebug       = qs.debug === '1' || qs.debug === 'true';
+    const silent          = qs.silent === '1' || qs.silent === 'true';
 
     const headers = {
       'X-Shopify-Access-Token': TOKEN,
@@ -76,8 +96,7 @@ exports.handler = async (event) => {
     let locationId = FIXED_LOCATION_ID ? Number(FIXED_LOCATION_ID) : null;
     if (!locationId) locationId = await getAnyLocationIdREST(STORE, headers);
 
-    // === Selectores ===
-    // 1) Por ID
+    // === 1) Por ID puntual ===
     if (productIdFilter) {
       const data = await gql(STORE, TOKEN, `
         query($id: ID!) {
@@ -97,7 +116,9 @@ exports.handler = async (event) => {
         }`, { id: `gid://shopify/Product/${productIdFilter}` });
 
       if (!data.product) {
-        return { statusCode: 200, body: JSON.stringify({ message: 'Run OK', note: 'Producto no encontrado', updated, skipped, debug }) };
+        const payload = { message: 'Run OK', note: 'Producto no encontrado', updated, skipped, debug };
+        if (silent) return { statusCode: 204, body: '' };
+        return { statusCode: 200, headers: {'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
       }
 
       await processProducts({
@@ -107,18 +128,17 @@ exports.handler = async (event) => {
         updated, skipped, debug, wantDebug
       });
 
-      return {
-        statusCode: 200,
-        body: JSON.stringify({
-          message: 'Run OK (single ID)',
-          filters: { productIdFilter, force },
-          counts: { updated: updated.length, skipped: skipped.length },
-          updated, skipped, debug
-        }, null, 2)
+      const payload = {
+        message: 'Run OK (single ID)',
+        filters: { productIdFilter, force },
+        counts: { updated: updated.length, skipped: skipped.length },
+        updated, skipped, debug
       };
+      if (silent) return { statusCode: 204, body: '' };
+      return { statusCode: 200, headers: {'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
     }
 
-    // 2) Por handle
+    // === 2) Por handle puntual ===
     if (handleFilter) {
       const data = await gql(STORE, TOKEN, `
         query($query:String!) {
@@ -148,18 +168,17 @@ exports.handler = async (event) => {
         updated, skipped, debug, wantDebug
       });
 
-      return {
-        statusCode: 200,
-        body: JSON.stringify({
-          message: 'Run OK (handle)',
-          filters: { handleFilter, force },
-          counts: { updated: updated.length, skipped: skipped.length },
-          updated, skipped, debug
-        }, null, 2)
+      const payload = {
+        message: 'Run OK (handle)',
+        filters: { handleFilter, force },
+        counts: { updated: updated.length, skipped: skipped.length },
+        updated, skipped, debug
       };
+      if (silent) return { statusCode: 204, body: '' };
+      return { statusCode: 200, headers: {'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
     }
 
-    // 3) MASIVO: solo productos con ambos metafields
+    // === 3) MASIVO: solo productos con ambos metafields ===
     let hasNextPage = true;
     let cursor = null;
     let totalFetched = 0;
@@ -205,20 +224,26 @@ exports.handler = async (event) => {
       await sleep(400); // pacing GraphQL
     }
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        message: 'Run OK (mass)',
-        counts: { fetchedWithMetafields: totalFetched, updated: updated.length, skipped: skipped.length },
-        updated, skipped, debug
-      }, null, 2)
+    const payload = {
+      message: 'Run OK (mass)',
+      counts: { fetchedWithMetafields: totalFetched, updated: updated.length, skipped: skipped.length },
+      updated, skipped, debug
     };
+    if (silent) return { statusCode: 204, body: '' };
+    return { statusCode: 200, headers: {'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
 
   } catch (err) {
+    // errores: responde corto; respeta silent
+    if (event?.queryStringParameters?.silent === '1' || event?.queryStringParameters?.silent === 'true') {
+      // registra en logs de Netlify y devuelve 204
+      console.error('Error actualizar-stock:', err?.message || err);
+      return { statusCode: 204, body: '' };
+    }
     return { statusCode: 500, body: JSON.stringify({ error: err?.message || String(err) }) };
   }
 };
 
+// === procesador de productos ===
 async function processProducts({
   products, STORE, VERSION, headers, defaultTZ, force, locationId,
   updated, skipped, debug, wantDebug
@@ -248,7 +273,7 @@ async function processProducts({
       continue;
     }
 
-    // Asegurar que el inventory item esté "tracked"
+    // Si el inventory item no está tracked, activarlo
     if (v.inventoryItem && v.inventoryItem.tracked === false) {
       try {
         await putJSON(`${STORE}/admin/api/${VERSION}/inventory_items/${v.inventoryItem.legacyResourceId}.json`, headers, {
@@ -261,10 +286,11 @@ async function processProducts({
       }
     }
 
-    // Setear inventario en la location
+    // Establecer inventario en la location
     try {
       const r = await fetch(`${STORE}/admin/api/${VERSION}/inventory_levels/set.json`, {
-        method: 'POST', headers,
+        method: 'POST',
+        headers,
         body: JSON.stringify({
           location_id: locationId,
           inventory_item_id: v.inventoryItem.legacyResourceId,
