@@ -1,6 +1,6 @@
 [build]
   command = ""
-  publish = "public" # o quítalo si no tienes front
+
 
 [functions]
   directory = "netlify/functions"
