@@ -1,11 +1,6 @@
 [build]
   command = ""
-  publish = "dist" # o bórralo si no tienes front
+  publish = "public" # o quítalo si no tienes front
 
-# (Opcional) dónde están tus funciones fuente
 [functions]
   directory = "netlify/functions"
-
-# Programa la función por nombre (sin [[ ]])
-[functions."actualizar-stock"]
-  schedule = "@daily"  # @hourly, @weekly, o cron "0 6 * * *"
