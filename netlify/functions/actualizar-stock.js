@@ -150,6 +150,16 @@ exports.handler = async (event) => {
         return { statusCode: 200, headers:{'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
       }
 
+      if (wantDebug) {
+        console.log('DEBUG - Producto encontrado:', {
+          id: data.product.id,
+          productFecha: data.product.productFecha?.value,
+          productStock: data.product.productStock?.value,
+          productTZ: data.product.productTZ?.value,
+          variantCount: data.product.variants?.nodes?.length
+        });
+      }
+
       await processProducts({
         products: [data.product],
         STORE, TOKEN, VERSION, headers,
@@ -185,9 +195,9 @@ exports.handler = async (event) => {
                   variantTZ: metafield(namespace: "custom", key: "timezone") { value }
                 }
               }
-              metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
+              productFecha: metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
               productStock: metafield(namespace: "custom", key: "stock_programado") { value }
-              metafieldTZ:   metafield(namespace: "custom", key: "timezone") { value }
+              productTZ:    metafield(namespace: "custom", key: "timezone") { value }
             }
           }
         }`, { query: `handle:${handleFilter}` });
@@ -246,9 +256,9 @@ exports.handler = async (event) => {
                   variantTZ: metafield(namespace: "custom", key: "timezone") { value }
                 }
               }
-              metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
+              productFecha: metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
               productStock: metafield(namespace: "custom", key: "stock_programado") { value }
-              metafieldTZ:   metafield(namespace: "custom", key: "timezone") { value }
+              productTZ:    metafield(namespace: "custom", key: "timezone") { value }
             }
           }
         }`, { after: cursor });
@@ -314,9 +324,9 @@ async function processProducts({
       return true; // señal para detener
     }
 
-    const fechaProducto = p?.metafield?.value ? String(p.metafield.value).slice(0, 10) : null;
+    const fechaProducto = p?.productFecha?.value ? String(p.productFecha.value).slice(0, 10) : null;
     const productStockVal = p?.productStock?.value ? parseInt(p.productStock.value, 10) : 0;
-    const productTZ = (p?.metafieldTZ?.value || defaultTZ).trim();
+    const productTZ = (p?.productTZ?.value || defaultTZ).trim();
 
     const variants = p?.variants?.nodes || [];
     if (!variants.length) {
