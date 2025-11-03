@@ -110,7 +110,7 @@ exports.handler = async (event) => {
     const handleFilter    = qs.handle || null;
     const variantIdFilter = qs.variantId ? Number(qs.variantId) : null;
     const force           = qs.force === '1' || qs.force === 'true';
-    const wantDebug       = qs.debug === '1' || qs.debug === 'true';
+    const wantDebug       = qs.debug === '1' || qs.debug === 'true' || !productIdFilter; // Debug automático en modo masivo
     const silent          = qs.silent === '1' || qs.silent === 'true';
     const cursorParam     = qs.cursor || null; // para continuar desde donde quedó
 
@@ -353,12 +353,12 @@ async function processProducts({
       const tzEfectiva = variantTZ || productTZ;
       const stockEfectivo = variantStockVal > 0 ? variantStockVal : productStockVal;
 
-      // IMPORTANTE: Si no hay fecha efectiva (ni producto ni variante), skip
-      if (!fechaEfectiva) {
+      // IMPORTANTE: Si no hay fecha efectiva Y no hay stock efectivo, skip completamente
+      if (!fechaEfectiva && (!stockEfectivo || stockEfectivo <= 0)) {
         skipped.push({ 
           productId: p.id, 
           variantId: v.legacyResourceId, 
-          reason: 'no_fecha_disponibilidad',
+          reason: 'no_metafields_configured',
           debug_fechaProducto: fechaProducto,
           debug_fechaVariante: fechaVariante,
           debug_productStockVal: productStockVal,
@@ -367,12 +367,24 @@ async function processProducts({
         continue;
       }
 
-      // IMPORTANTE: Si no hay stock efectivo (ni producto ni variante), skip
+      // Si no hay fecha efectiva, skip (necesitamos fecha para validar)
+      if (!fechaEfectiva) {
+        skipped.push({ 
+          productId: p.id, 
+          variantId: v.legacyResourceId, 
+          reason: 'no_fecha_disponibilidad',
+          stockEfectivo
+        });
+        continue;
+      }
+
+      // Si no hay stock efectivo, skip
       if (!stockEfectivo || stockEfectivo <= 0) {
         skipped.push({ 
           productId: p.id, 
           variantId: v.legacyResourceId, 
           reason: 'invalid_or_zero_stock', 
+          fechaEfectiva,
           stockEfectivo 
         });
         continue;
