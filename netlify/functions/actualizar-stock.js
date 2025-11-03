@@ -338,10 +338,33 @@ async function processProducts({
       const variantStockVal = v?.variantStock?.value ? parseInt(v.variantStock.value, 10) : 0;
       const variantTZ = v?.variantTZ?.value ? v.variantTZ.value.trim() : null;
 
+      // Determinar valores efectivos con fallback
       const fechaEfectiva = fechaVariante || fechaProducto;
       const tzEfectiva = variantTZ || productTZ;
-      const todayLocal = ymdInTZ(new Date(), tzEfectiva);
       const stockEfectivo = variantStockVal > 0 ? variantStockVal : productStockVal;
+
+      // IMPORTANTE: Si no hay fecha efectiva (ni producto ni variante), skip
+      if (!fechaEfectiva) {
+        skipped.push({ 
+          productId: p.id, 
+          variantId: v.legacyResourceId, 
+          reason: 'no_fecha_disponibilidad'
+        });
+        continue;
+      }
+
+      // IMPORTANTE: Si no hay stock efectivo (ni producto ni variante), skip
+      if (!stockEfectivo || stockEfectivo <= 0) {
+        skipped.push({ 
+          productId: p.id, 
+          variantId: v.legacyResourceId, 
+          reason: 'invalid_or_zero_stock', 
+          stockEfectivo 
+        });
+        continue;
+      }
+
+      const todayLocal = ymdInTZ(new Date(), tzEfectiva);
 
       if (wantDebug) {
         debug.push({
@@ -355,23 +378,14 @@ async function processProducts({
         });
       }
 
-      if (!force && (!fechaEfectiva || fechaEfectiva !== todayLocal)) {
+      // Validar fecha solo si no es force
+      if (!force && fechaEfectiva !== todayLocal) {
         skipped.push({ 
           productId: p.id, 
           variantId: v.legacyResourceId, 
-          reason: 'date_mismatch_or_empty', 
+          reason: 'date_mismatch', 
           fechaEfectiva, 
           todayLocal 
-        });
-        continue;
-      }
-
-      if (!stockEfectivo || stockEfectivo < 0) {
-        skipped.push({ 
-          productId: p.id, 
-          variantId: v.legacyResourceId, 
-          reason: 'invalid_or_zero_stock', 
-          stockEfectivo 
         });
         continue;
       }
