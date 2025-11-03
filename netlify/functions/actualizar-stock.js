@@ -241,8 +241,7 @@ exports.handler = async (event) => {
         query($after:String) {
           products(
             first: 20,
-            after: $after,
-            query: "metafield:custom.fecha_disponibilidad:* AND metafield:custom.stock_programado:*"
+            after: $after
           ) {
             pageInfo { hasNextPage endCursor }
             nodes {
@@ -460,5 +459,6 @@ async function processProducts({
 
     await sleep(100);
   }
-}
+  
   return false; // continuar procesando
+}
