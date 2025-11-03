@@ -107,7 +107,7 @@ exports.handler = async (event) => {
     const qs = event.queryStringParameters || {};
     const productIdFilter = qs.productId ? Number(qs.productId) : null;
     const handleFilter    = qs.handle || null;
-    const variantIdFilter = qs.variantId ? Number(qs.variantId) : null; // NUEVO
+    const variantIdFilter = qs.variantId ? Number(qs.variantId) : null;
     const force           = qs.force === '1' || qs.force === 'true';
     const wantDebug       = qs.debug === '1' || qs.debug === 'true';
     const silent          = qs.silent === '1' || qs.silent === 'true';
@@ -133,6 +133,8 @@ exports.handler = async (event) => {
                 legacyResourceId
                 inventoryItem { id legacyResourceId tracked }
                 variantStock: metafield(namespace: "custom", key: "stock_programado") { value }
+                variantFecha: metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
+                variantTZ: metafield(namespace: "custom", key: "timezone") { value }
               }
             }
             metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
@@ -178,6 +180,8 @@ exports.handler = async (event) => {
                   legacyResourceId
                   inventoryItem { id legacyResourceId tracked }
                   variantStock: metafield(namespace: "custom", key: "stock_programado") { value }
+                  variantFecha: metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
+                  variantTZ: metafield(namespace: "custom", key: "timezone") { value }
                 }
               }
               metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
@@ -207,7 +211,7 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers:{'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
     }
 
-    // ======== MASIVO: solo productos con ambos metafields a nivel producto ========
+    // ======== MASIVO: productos con metafields a nivel producto O variantes con metafields ========
     let hasNextPage = true;
     let cursor = null;
     let totalFetched = 0;
@@ -229,6 +233,8 @@ exports.handler = async (event) => {
                   legacyResourceId
                   inventoryItem { id legacyResourceId tracked }
                   variantStock: metafield(namespace: "custom", key: "stock_programado") { value }
+                  variantFecha: metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
+                  variantTZ: metafield(namespace: "custom", key: "timezone") { value }
                 }
               }
               metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
@@ -280,16 +286,11 @@ async function processProducts({
   variantIdFilter
 }) {
   for (const p of products) {
-    const fecha = p?.metafield?.value ? String(p.metafield.value).slice(0, 10) : null;
+    const fechaProducto = p?.metafield?.value ? String(p.metafield.value).slice(0, 10) : null;
     const productStockVal = p?.productStock?.value ? parseInt(p.productStock.value, 10) : 0;
     const productTZ = (p?.metafieldTZ?.value || defaultTZ).trim();
-    const todayLocal = ymdInTZ(new Date(), productTZ);
 
     const variants = p?.variants?.nodes || [];
-    if (!force && (!fecha || fecha !== todayLocal)) {
-      skipped.push({ productId: p.id, reason: 'date_mismatch_or_empty', fecha, todayLocal });
-      continue;
-    }
     if (!variants.length) {
       skipped.push({ productId: p.id, reason: 'no_variants' });
       continue;
@@ -301,22 +302,50 @@ async function processProducts({
         continue;
       }
 
+      // Prioridad: metafields de variante sobre metafields de producto
+      const fechaVariante = v?.variantFecha?.value ? String(v.variantFecha.value).slice(0, 10) : null;
       const variantStockVal = v?.variantStock?.value ? parseInt(v.variantStock.value, 10) : 0;
-      const stockToSet = variantStockVal > 0 ? variantStockVal : productStockVal;
+      const variantTZ = v?.variantTZ?.value ? v.variantTZ.value.trim() : null;
+
+      // Determinar fecha y TZ efectivos
+      const fechaEfectiva = fechaVariante || fechaProducto;
+      const tzEfectiva = variantTZ || productTZ;
+      const todayLocal = ymdInTZ(new Date(), tzEfectiva);
+
+      // Determinar stock efectivo
+      const stockEfectivo = variantStockVal > 0 ? variantStockVal : productStockVal;
 
       if (wantDebug) {
         debug.push({
           productId: p.id, handle: p.handle,
-          fecha, productTZ, todayLocal,
           variantId: v.legacyResourceId,
+          fechaProducto, fechaVariante, fechaEfectiva,
+          productTZ, variantTZ, tzEfectiva, todayLocal,
+          productStockVal, variantStockVal, stockEfectivo,
           variantItemId: v?.inventoryItem?.legacyResourceId,
-          variantTracked: v?.inventoryItem?.tracked,
-          variantStockVal, productStockVal, stockToSet
+          variantTracked: v?.inventoryItem?.tracked
         });
       }
 
-      if (!stockToSet || stockToSet < 0) {
-        skipped.push({ productId: p.id, variantId: v.legacyResourceId, reason: 'invalid_or_zero_stock', stockToSet });
+      // Validar fecha (si no es force)
+      if (!force && (!fechaEfectiva || fechaEfectiva !== todayLocal)) {
+        skipped.push({ 
+          productId: p.id, 
+          variantId: v.legacyResourceId, 
+          reason: 'date_mismatch_or_empty', 
+          fechaEfectiva, 
+          todayLocal 
+        });
+        continue;
+      }
+
+      if (!stockEfectivo || stockEfectivo < 0) {
+        skipped.push({ 
+          productId: p.id, 
+          variantId: v.legacyResourceId, 
+          reason: 'invalid_or_zero_stock', 
+          stockEfectivo 
+        });
         continue;
       }
 
@@ -335,12 +364,17 @@ async function processProducts({
         body: JSON.stringify({
           location_id: locationId,
           inventory_item_id: v.inventoryItem.legacyResourceId,
-          available: stockToSet
+          available: stockEfectivo
         })
       });
       const tx = await r.text();
       if (!r.ok) {
-        skipped.push({ productId: p.id, variantId: v.legacyResourceId, reason: 'inventory_set_failed', text: tx });
+        skipped.push({ 
+          productId: p.id, 
+          variantId: v.legacyResourceId, 
+          reason: 'inventory_set_failed', 
+          text: tx 
+        });
         continue;
       }
 
@@ -364,7 +398,8 @@ async function processProducts({
         variantId: v.legacyResourceId,
         inventoryItemId: v.inventoryItem.legacyResourceId,
         locationId,
-        setTo: stockToSet,
+        setTo: stockEfectivo,
+        usedVariantMetafields: variantStockVal > 0 || !!fechaVariante,
         clearedVariantToZero: variantStockVal > 0,
         clearedProductToZero: variantStockVal > 0 ? false : productStockVal > 0,
         fechaAplicada: force ? '(FORCED)' : todayLocal
