@@ -241,7 +241,8 @@ exports.handler = async (event) => {
         query($after:String) {
           products(
             first: 20,
-            after: $after
+            after: $after,
+            query: "tag:stock-programado"
           ) {
             pageInfo { hasNextPage endCursor }
             nodes {
