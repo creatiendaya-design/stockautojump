@@ -111,7 +111,6 @@ exports.handler = async (event) => {
     const force           = qs.force === '1' || qs.force === 'true';
     const wantDebug       = qs.debug === '1' || qs.debug === 'true';
     const silent          = qs.silent === '1' || qs.silent === 'true';
-    const maxProducts     = qs.maxProducts ? parseInt(qs.maxProducts, 10) : 50; // límite por ejecución
 
     const headers = { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' };
     const updated = [];
@@ -259,7 +258,7 @@ exports.handler = async (event) => {
       hasNextPage = data?.products?.pageInfo?.hasNextPage || false;
       cursor      = data?.products?.pageInfo?.endCursor || null;
 
-      await sleep(200); // pacing GraphQL
+      await sleep(400); // pacing GraphQL
     }
 
     const payload = {
@@ -355,7 +354,7 @@ async function processProducts({
         await putJSON(`${STORE}/admin/api/${VERSION}/inventory_items/${v.inventoryItem.legacyResourceId}.json`, headers, {
           inventory_item: { id: v.inventoryItem.legacyResourceId, tracked: true }
         });
-        await sleep(100);
+        await sleep(150);
       }
 
       // Setear inventario
