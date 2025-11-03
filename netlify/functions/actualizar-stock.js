@@ -156,7 +156,8 @@ exports.handler = async (event) => {
           productFecha: data.product.productFecha?.value,
           productStock: data.product.productStock?.value,
           productTZ: data.product.productTZ?.value,
-          variantCount: data.product.variants?.nodes?.length
+          variantCount: data.product.variants?.nodes?.length,
+          rawProduct: JSON.stringify(data.product, null, 2)
         });
       }
 
