@@ -359,7 +359,11 @@ async function processProducts({
         skipped.push({ 
           productId: p.id, 
           variantId: v.legacyResourceId, 
-          reason: 'no_fecha_disponibilidad'
+          reason: 'no_fecha_disponibilidad',
+          debug_fechaProducto: fechaProducto,
+          debug_fechaVariante: fechaVariante,
+          debug_productStockVal: productStockVal,
+          debug_variantStockVal: variantStockVal
         });
         continue;
       }
