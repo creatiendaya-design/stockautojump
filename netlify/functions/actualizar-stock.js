@@ -49,7 +49,6 @@ async function putJSON(url, headers, body) {
   if (!r.ok) throw new Error(`PUT ${url} -> ${r.status}: ${tx}`);
   return JSON.parse(tx);
 }
-// Dejar en "vacío" (0) un metafield integer vía GraphQL
 async function setMetafieldIntZero(store, token, ownerIdGID, namespace, key) {
   const version = process.env.SHOPIFY_API_VERSION || '2024-07';
   const r = await fetch(`${store}/admin/api/${version}/graphql.json`, {
@@ -88,12 +87,15 @@ async function setMetafieldIntZero(store, token, ownerIdGID, namespace, key) {
 
 // ========= handler =========
 exports.handler = async (event) => {
+  const startTime = Date.now();
+  const TIMEOUT_MS = 8000; // 8 segundos límite (dejamos margen antes del timeout de Netlify)
+  
   try {
-    const STORE   = process.env.SHOPIFY_STORE;        // https://tu-tienda.myshopify.com
-    const TOKEN   = process.env.SHOPIFY_API_KEY;      // shpat_...
+    const STORE   = process.env.SHOPIFY_STORE;
+    const TOKEN   = process.env.SHOPIFY_API_KEY;
     const VERSION = process.env.SHOPIFY_API_VERSION || '2024-07';
     const DEFAULT_TZ = process.env.TIMEZONE || 'America/New_York';
-    const FIXED_LOCATION_ID = process.env.LOCATION_ID; // opcional
+    const FIXED_LOCATION_ID = process.env.LOCATION_ID;
 
     const missing = [];
     if (!STORE) missing.push('SHOPIFY_STORE');
@@ -103,7 +105,6 @@ exports.handler = async (event) => {
       return { statusCode: 500, body: JSON.stringify({ error: 'Faltan variables', missing }) };
     }
 
-    // Query params
     const qs = event.queryStringParameters || {};
     const productIdFilter = qs.productId ? Number(qs.productId) : null;
     const handleFilter    = qs.handle || null;
@@ -111,13 +112,13 @@ exports.handler = async (event) => {
     const force           = qs.force === '1' || qs.force === 'true';
     const wantDebug       = qs.debug === '1' || qs.debug === 'true';
     const silent          = qs.silent === '1' || qs.silent === 'true';
+    const cursorParam     = qs.cursor || null; // para continuar desde donde quedó
 
     const headers = { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' };
     const updated = [];
     const skipped = [];
     const debug   = [];
 
-    // Location
     let locationId = FIXED_LOCATION_ID ? Number(FIXED_LOCATION_ID) : null;
     if (!locationId) locationId = await getAnyLocationIdREST(STORE, headers);
 
@@ -154,7 +155,7 @@ exports.handler = async (event) => {
         STORE, TOKEN, VERSION, headers,
         defaultTZ: DEFAULT_TZ, force, locationId,
         updated, skipped, debug, wantDebug,
-        variantIdFilter
+        variantIdFilter, startTime, TIMEOUT_MS
       });
 
       const payload = {
@@ -198,7 +199,7 @@ exports.handler = async (event) => {
         STORE, TOKEN, VERSION, headers,
         defaultTZ: DEFAULT_TZ, force, locationId,
         updated, skipped, debug, wantDebug,
-        variantIdFilter
+        variantIdFilter, startTime, TIMEOUT_MS
       });
 
       const payload = {
@@ -211,16 +212,24 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers:{'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
     }
 
-    // ======== MASIVO: productos con metafields a nivel producto O variantes con metafields ========
+    // ======== MASIVO: procesamiento por lotes con timeout ========
     let hasNextPage = true;
-    let cursor = null;
+    let cursor = cursorParam;
     let totalFetched = 0;
+    let processedProducts = 0;
+    let timeoutReached = false;
 
-    while (hasNextPage) {
+    while (hasNextPage && !timeoutReached) {
+      // Verificar si nos acercamos al timeout
+      if (Date.now() - startTime > TIMEOUT_MS) {
+        timeoutReached = true;
+        break;
+      }
+
       const data = await gql(STORE, TOKEN, `
         query($after:String) {
           products(
-            first: 100,
+            first: 20,
             after: $after,
             query: "metafield:custom.fecha_disponibilidad:* AND metafield:custom.stock_programado:*"
           ) {
@@ -247,25 +256,39 @@ exports.handler = async (event) => {
       const products = data?.products?.nodes || [];
       totalFetched += products.length;
 
-      await processProducts({
+      const stopProcessing = await processProducts({
         products,
         STORE, TOKEN, VERSION, headers,
         defaultTZ: DEFAULT_TZ, force, locationId,
         updated, skipped, debug, wantDebug,
-        variantIdFilter
+        variantIdFilter, startTime, TIMEOUT_MS
       });
 
-      hasNextPage = data?.products?.pageInfo?.hasNextPage || false;
-      cursor      = data?.products?.pageInfo?.endCursor || null;
+      if (stopProcessing) {
+        timeoutReached = true;
+        break;
+      }
 
-      await sleep(400); // pacing GraphQL
+      processedProducts += products.length;
+      hasNextPage = data?.products?.pageInfo?.hasNextPage || false;
+      cursor = data?.products?.pageInfo?.endCursor || null;
+
+      await sleep(150);
     }
 
     const payload = {
-      message: 'Run OK (mass)',
-      counts: { fetchedWithMetafields: totalFetched, updated: updated.length, skipped: skipped.length },
+      message: timeoutReached ? 'Run OK (partial - timeout approaching)' : 'Run OK (complete)',
+      counts: { 
+        processedProducts,
+        updated: updated.length, 
+        skipped: skipped.length,
+        hasMore: hasNextPage
+      },
+      nextCursor: hasNextPage ? cursor : null,
+      continueUrl: hasNextPage ? `${STORE.replace('/admin', '')}/.netlify/functions/actualizar-stock?cursor=${encodeURIComponent(cursor)}${force ? '&force=1' : ''}${silent ? '&silent=1' : ''}` : null,
       updated, skipped, debug
     };
+    
     if (silent) return { statusCode: 204, body: '' };
     return { statusCode: 200, headers:{'Cache-Control':'no-store'}, body: JSON.stringify(summarize(payload), null, 2) };
 
@@ -279,13 +302,18 @@ exports.handler = async (event) => {
   }
 };
 
-// ========= procesador (itera TODAS las variantes) =========
+// ========= procesador con control de timeout =========
 async function processProducts({
   products, STORE, TOKEN, VERSION, headers, defaultTZ, force, locationId,
   updated, skipped, debug, wantDebug,
-  variantIdFilter
+  variantIdFilter, startTime, TIMEOUT_MS
 }) {
   for (const p of products) {
+    // Verificar timeout antes de cada producto
+    if (Date.now() - startTime > TIMEOUT_MS) {
+      return true; // señal para detener
+    }
+
     const fechaProducto = p?.metafield?.value ? String(p.metafield.value).slice(0, 10) : null;
     const productStockVal = p?.productStock?.value ? parseInt(p.productStock.value, 10) : 0;
     const productTZ = (p?.metafieldTZ?.value || defaultTZ).trim();
@@ -297,22 +325,22 @@ async function processProducts({
     }
 
     for (const v of variants) {
+      // Verificar timeout antes de cada variante
+      if (Date.now() - startTime > TIMEOUT_MS) {
+        return true;
+      }
+
       if (variantIdFilter && Number(v.legacyResourceId) !== variantIdFilter) {
-        // Si me piden una variante específica, ignoro las otras
         continue;
       }
 
-      // Prioridad: metafields de variante sobre metafields de producto
       const fechaVariante = v?.variantFecha?.value ? String(v.variantFecha.value).slice(0, 10) : null;
       const variantStockVal = v?.variantStock?.value ? parseInt(v.variantStock.value, 10) : 0;
       const variantTZ = v?.variantTZ?.value ? v.variantTZ.value.trim() : null;
 
-      // Determinar fecha y TZ efectivos
       const fechaEfectiva = fechaVariante || fechaProducto;
       const tzEfectiva = variantTZ || productTZ;
       const todayLocal = ymdInTZ(new Date(), tzEfectiva);
-
-      // Determinar stock efectivo
       const stockEfectivo = variantStockVal > 0 ? variantStockVal : productStockVal;
 
       if (wantDebug) {
@@ -327,7 +355,6 @@ async function processProducts({
         });
       }
 
-      // Validar fecha (si no es force)
       if (!force && (!fechaEfectiva || fechaEfectiva !== todayLocal)) {
         skipped.push({ 
           productId: p.id, 
@@ -349,15 +376,13 @@ async function processProducts({
         continue;
       }
 
-      // Asegurar tracked
       if (v.inventoryItem && v.inventoryItem.tracked === false) {
         await putJSON(`${STORE}/admin/api/${VERSION}/inventory_items/${v.inventoryItem.legacyResourceId}.json`, headers, {
           inventory_item: { id: v.inventoryItem.legacyResourceId, tracked: true }
         });
-        await sleep(150);
+        await sleep(80);
       }
 
-      // Setear inventario
       const r = await fetch(`${STORE}/admin/api/${VERSION}/inventory_levels/set.json`, {
         method: 'POST',
         headers,
@@ -378,17 +403,13 @@ async function processProducts({
         continue;
       }
 
-      // Vaciar a 0 el metafield usado
       try {
         if (variantStockVal > 0) {
-          // Se usó el stock de la variante → vaciar solo variante
           await setMetafieldIntZero(STORE, TOKEN, v.id, 'custom', 'stock_programado');
         } else if (productStockVal > 0) {
-          // Se usó el stock del producto → vaciar en producto
           await setMetafieldIntZero(STORE, TOKEN, p.id, 'custom', 'stock_programado');
         }
       } catch (e) {
-        // No crítico
         console.warn('metafieldsSet -> 0 failed:', e.message);
       }
 
@@ -405,9 +426,11 @@ async function processProducts({
         fechaAplicada: force ? '(FORCED)' : todayLocal
       });
 
-      await sleep(100); // pacing REST entre variantes
+      await sleep(80);
     }
 
-    await sleep(150); // pacing entre productos
+    await sleep(100);
   }
+  
+  return false; // continuar procesando
 }
