@@ -138,9 +138,9 @@ exports.handler = async (event) => {
                 variantTZ: metafield(namespace: "custom", key: "timezone") { value }
               }
             }
-            metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
+            productFecha: metafield(namespace: "custom", key: "fecha_disponibilidad") { value }
             productStock: metafield(namespace: "custom", key: "stock_programado") { value }
-            metafieldTZ:   metafield(namespace: "custom", key: "timezone") { value }
+            productTZ:    metafield(namespace: "custom", key: "timezone") { value }
           }
         }`, { id: `gid://shopify/Product/${productIdFilter}` });
 
@@ -460,6 +460,5 @@ async function processProducts({
 
     await sleep(100);
   }
-  
-  return false; // continuar procesando
 }
+  return false; // continuar procesando
